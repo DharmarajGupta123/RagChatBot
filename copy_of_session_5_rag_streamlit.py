@@ -18,14 +18,14 @@ First, let's install the necessary libraries.
 """
 
 # Install required packages
-!pip install langchain langchain-google-genai langchain_community pypdf chromadb sentence-transformers -q
-!pip install google-generativeai pdfplumber -q
+pip install langchain langchain-google-genai langchain_community pypdf chromadb sentence-transformers -q
+pip install google-generativeai pdfplumber -q
 
 """Next, let's import all required libraries:"""
 
-!pip install streamlit
+pip install streamlit
 
-!pip install pyngrok
+pip install pyngrok
 
 import os
 import pdfplumber
@@ -302,7 +302,7 @@ os.environ["GOOGLE_API_KEY"] = userdata.get("gemini")
 # if __name__ == "__main__":
 #     main()
 
-!streamlit run rag_streamlit.py --server.port=8989 &>./logs.txt &
+streamlit run rag_streamlit.py --server.port=8989 &>./logs.txt &
 
 from pyngrok import ngrok
 from google.colab import userdata
