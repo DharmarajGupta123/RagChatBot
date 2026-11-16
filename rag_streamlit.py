@@ -3,6 +3,7 @@
 import streamlit as st
 import os
 import tempfile
+import time
 from session_4_rag_backend import (
     setup_api_key,
     upload_pdf,
@@ -14,6 +15,7 @@ from session_4_rag_backend import (
     get_context_from_chunks,
     query_with_full_context
 )
+from semantic_cache import SemanticCache, compute_doc_version
 
 st.set_page_config(page_title="RAG Chatbot with Gemini", page_icon="📚", layout="wide")
 
@@ -25,6 +27,10 @@ if "embedding_model" not in st.session_state:
     st.session_state.embedding_model = None
 if "processed_files" not in st.session_state:
     st.session_state.processed_files = []
+if "semantic_cache" not in st.session_state:
+    st.session_state.semantic_cache = None
+if "doc_version" not in st.session_state:
+    st.session_state.doc_version = None
 
 def main():
     with st.sidebar:
@@ -49,9 +55,33 @@ def main():
                 st.write(f"- {file}")
 
         st.divider()
+        st.subheader("Semantic Cache")
+        cache = st.session_state.semantic_cache
+        if cache is None:
+            st.write("Process documents to enable the cache.")
+        else:
+            stats = cache.summary()
+            col1, col2 = st.columns(2)
+            col1.metric("Hit rate", f"{stats['hit_rate']:.0%}")
+            col2.metric("Entries", stats["entries"] if stats["entries"] is not None else "–")
+            st.write(f"Hits: {stats['hits']} · Misses: {stats['misses']}")
+            if stats["avg_hit_latency_ms"] is not None:
+                st.write(f"Avg hit latency: {stats['avg_hit_latency_ms']} ms")
+            if stats["avg_miss_latency_ms"] is not None:
+                st.write(f"Avg miss (full RAG) latency: {stats['avg_miss_latency_ms']} ms")
+            st.write(f"Approx. output tokens saved: {stats['approx_output_tokens_saved']}")
+            if st.button("Clear cache"):
+                removed = cache.clear()
+                st.success(f"Cleared {removed} cached entries.")
+
+        st.divider()
         with st.expander("Advanced Options"):
             st.slider("Number of chunks to retrieve (k)", min_value=1, max_value=10, value=3, key="k_value")
             st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.1, key="temperature")
+            st.slider("Cache similarity threshold", min_value=0.70, max_value=0.95, value=0.90, step=0.05, key="cache_threshold")
+
+    if st.session_state.semantic_cache is not None and "cache_threshold" in st.session_state:
+        st.session_state.semantic_cache.similarity_threshold = st.session_state.cache_threshold
 
     st.title("Retrieval Augmented Generation Chatbot")
 
@@ -81,6 +111,17 @@ def process_documents(uploaded_files):
             if st.session_state.embedding_model is None:
                 st.sidebar.error("Failed to initialize embedding model. Check your API key.")
                 return
+
+        # Version these documents and (re)use the semantic cache. The
+        # cache uses free local embeddings, so this needs no API key.
+        st.session_state.doc_version = compute_doc_version(
+            [(f.name, f.getvalue()) for f in uploaded_files]
+        )
+        if st.session_state.semantic_cache is None:
+            status_text.text("Loading local embedding model for the cache (first run downloads ~440 MB)...")
+            st.session_state.semantic_cache = SemanticCache(
+                persist_directory="./cache_chroma_db",
+            )
 
         all_chunks = []
         processed_file_names = []
@@ -124,7 +165,8 @@ def process_documents(uploaded_files):
             vectorstore = store_embeddings(
                 st.session_state.embedding_model,
                 texts,
-                persist_directory="./streamlit_chroma_db"
+                persist_directory="./streamlit_chroma_db",
+                metadatas=metadatas,
             )
 
             if vectorstore:
@@ -155,13 +197,36 @@ def handle_user_query(query):
     try:
         k = st.session_state.k_value
         temperature = st.session_state.temperature
+        cache = st.session_state.semantic_cache
+        doc_version = st.session_state.doc_version
 
+        # Check the semantic cache before running RAG.
+        if cache is not None and doc_version is not None:
+            hit = cache.lookup(query, doc_version)
+            if hit:
+                st.session_state.conversation.append({
+                    "role": "assistant",
+                    "content": hit.answer,
+                    "cached": True,
+                    "similarity": hit.similarity,
+                    "matched_question": hit.matched_question,
+                })
+                thinking_placeholder.empty()
+                display_chat()
+                return
+
+        # Cache miss: run the normal RAG pipeline and time it.
+        start = time.perf_counter()
         response, context, chunks = query_with_full_context(
             query,
             st.session_state.vectorstore,
             k=k,
             temperature=temperature
         )
+        if cache is not None:
+            cache.record_miss_latency(time.perf_counter() - start)
+            if doc_version is not None:
+                cache.add(query, response, doc_version)
 
         st.session_state.conversation.append({"role": "assistant", "content": response, "context": context})
         thinking_placeholder.empty()
@@ -181,6 +246,12 @@ def display_chat():
         else:
             with st.chat_message("assistant"):
                 st.write(message["content"])
+                if message.get("cached"):
+                    st.caption(
+                        f"⚡ Served from semantic cache "
+                        f"(similarity {message['similarity']:.2f} to "
+                        f"“{message['matched_question']}”)"
+                    )
                 if "context" in message and message["context"]:
                     with st.expander("View source context"):
                         st.text(message["context"])
