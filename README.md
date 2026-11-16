@@ -78,6 +78,54 @@ point that keeps this false-positive rate low while still catching
 reworded questions. A cross-encoder verification step would be the
 next improvement.
 
+## RAG security testing
+
+Documents a RAG chatbot retrieves are untrusted input: a PDF can hide
+instructions ("ignore previous instructions", "you are now...") that
+the model may follow. `evaluate_security.py` measures that risk on a
+fixed test set of 12 injection attacks (each embedded in a realistic
+policy/manual chunk, each asking the model to output a unique canary
+word) plus 12 benign chunks, then re-measures with the guardrails on.
+
+Guardrails (`rag_guardrails.py`): a transparent rule-based detector
+flags injection-like imperatives aimed at the assistant, flagged
+chunks are dropped before they reach the prompt, and a hardened prompt
+wraps the context in delimiters and states the documents are data, not
+instructions. The app's query path uses them by default
+(`use_guardrails=True` in `query_with_full_context`).
+
+Measured 2026-11-17 (victim LLM: Pollinations text API, model=openai;
+retrieval: local bge-base embeddings, top-3, 12 attacks):
+
+| metric | result |
+|---|---:|
+| Retrieval exposure (injected chunk in top-3) | 11/12 (92%) |
+| Attack success rate BEFORE guardrails | 9/12 (75%) |
+| Attack success rate BEFORE, retrieved attacks only | 9/11 (82%) |
+| Attack success rate AFTER guardrails | 0/12 (0%) |
+| Filter: injected chunks flagged | 12/12 |
+| Filter: benign chunks flagged (false positives) | 0/12 (0%) |
+| Scan latency overhead | 0.16 ms per chunk |
+
+The unguarded model complied with 9 of the 11 retrieved attacks --
+its answers literally start with the injected canary word -- including
+a system-prompt extraction attack that got it to output ~1,200
+characters of system-prompt-like text. The two attacks it resisted
+were verbatim context exfiltration and a pirate role-play. With the
+guardrails on, the filter dropped the injected chunk from every
+retrieved set (1 of 3 chunks each time) and no attack succeeded; the
+remaining benign chunks still answered every question correctly.
+
+Limitations: the victim LLM is Pollinations' free text API
+(model=openai), measured 2026-11-17 -- a different model may comply
+more or less, and Pollinations responses are non-deterministic, so
+re-runs may differ by an attack or two. The detector is rule-based,
+not ML: a paraphrased injection that avoids every pattern will pass
+the filter (the hardened prompt is the second layer). Canary presence
+is the attack-success signal; a model quoting the injection rather
+than following it would also trip it -- every answer is saved in the
+JSONL file for audit.
+
 ## Run it
 
 ```bash
@@ -95,6 +143,10 @@ embeddings and needs no key — first run downloads the model (~440 MB).
 - `session_4_rag_backend.py` — PDF parsing, chunking, embeddings, RAG
 - `evaluate_cache.py` — test-set generator + threshold sweep
 - `test_semantic_cache.py` — 15 unit tests (no API key needed)
+- `rag_guardrails.py` — prompt-injection detector, sanitizer, hardened prompt
+- `security_test_set.py` — 12 injection attacks + 12 benign chunks
+- `evaluate_security.py` — before/after security evaluation harness
+- `test_guardrails.py` — 13 unit tests (no API calls)
 - `INTEGRATION.md` — what changed where, and how to verify it
 
 ## Re-measure it
@@ -109,4 +161,9 @@ python evaluate_cache.py run --local
 # Generate a test set about YOUR document (needs a Gemini API key)
 python evaluate_cache.py generate --api-key YOUR_KEY --out test_set.json
 python evaluate_cache.py run --local --test-set test_set.json
+
+# Security evaluation: injection attacks before/after guardrails
+python evaluate_security.py run --skip-llm   # retrieval + filter only, no LLM calls
+python evaluate_security.py run              # full run (needs internet, ~10 min)
+python test_guardrails.py                    # guardrail unit tests, no API calls
 ```

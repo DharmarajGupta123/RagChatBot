@@ -269,7 +269,8 @@ def query_with_full_context(
     vectorstore: Chroma, 
     model_name: str = "gemini-2.0-flash-thinking-exp-01-21", 
     k: int = 3,
-    temperature: float = 0.3
+    temperature: float = 0.3,
+    use_guardrails: bool = True
 ) -> Tuple[str, str, List[Any]]:
     """
     Comprehensive query function that handles document chunks and provides detailed source tracking.
@@ -280,6 +281,10 @@ def query_with_full_context(
         model_name (str): Name of the Gemini model to use
         k (int): Number of chunks to retrieve
         temperature (float): Temperature for response generation
+        use_guardrails (bool): If True (default), drop retrieved chunks
+            that contain prompt-injection instructions and use the
+            hardened prompt (see rag_guardrails.py). Pass False to
+            restore the original unguarded behaviour.
         
     Returns:
         tuple: (response, context, chunks)
@@ -292,11 +297,31 @@ def query_with_full_context(
         )
         relevant_chunks = retriever.get_relevant_documents(query)
         
+        # 1b. Guardrails (on by default): retrieved documents are untrusted
+        # input and can contain instructions aimed at the assistant
+        # ("ignore previous instructions", "you are now...", ...). Drop
+        # flagged chunks before they reach the prompt, and use the hardened
+        # prompt, which treats the context as data, not commands (see
+        # rag_guardrails.py). Fail-open: any guardrail error leaves the
+        # chunks untouched and falls back to the original prompt, so the
+        # chatbot keeps working.
+        prompt_builder = None
+        if use_guardrails:
+            try:
+                from rag_guardrails import build_hardened_prompt, sanitize_context
+                relevant_chunks, _guardrail_report = sanitize_context(relevant_chunks)
+                prompt_builder = build_hardened_prompt
+            except Exception as guardrail_error:
+                print(f"Guardrails failed ({guardrail_error}); using unguarded prompt.")
+        
         # 2. Get combined context
         context = get_context_from_chunks(relevant_chunks)
         
         # 3. Create enhanced prompt
-        prompt = f"""You are a helpful AI assistant answering questions based on provided context.
+        if prompt_builder is not None:
+            prompt = prompt_builder(context, query)
+        else:
+            prompt = f"""You are a helpful AI assistant answering questions based on provided context.
 
 Use ONLY the following context to answer the question. 
 If the answer cannot be determined from the context, respond with "I cannot answer this based on the provided context."
